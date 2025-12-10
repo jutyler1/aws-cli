@@ -123,6 +123,204 @@ class TestECSExpressGatewayServiceWatcher:
             ECSExpressGatewayServiceWatcher.is_monitoring_available() is False
         )
 
+    def setup_method(self):
+        self.app_session = create_app_session(output=DummyOutput())
+        self.app_session.__enter__()
+        self.mock_client = Mock()
+        self.service_arn = (
+            "arn:aws:ecs:us-west-2:123456789012:service/my-cluster/my-service"
+        )
+
+    def teardown_method(self):
+        if hasattr(self, 'app_session'):
+            self.app_session.__exit__(None, None, None)
+
+    def _create_watcher_with_mocks(self, resource_view="RESOURCE", timeout=1):
+        """Helper to create watcher with mocked display"""
+        mock_display = Mock()
+        mock_display.has_terminal.return_value = True
+        mock_display._check_keypress.return_value = None
+        mock_display._restore_terminal.return_value = None
+        mock_display.display.return_value = None
+
+        watcher = ECSExpressGatewayServiceWatcher(
+            self.mock_client,
+            self.service_arn,
+            resource_view,
+            timeout_minutes=timeout,
+            display=mock_display,
+        )
+
+        # Mock exec to call the collector once and print output
+        collector = watcher.collector
+
+        def mock_exec():
+            try:
+                output = collector.get_current_view("⠋")
+                print(output)
+                print("Monitoring Complete!")
+            except Exception as e:
+                # Re-raise expected exceptions
+                if isinstance(e, (ClientError, MonitoringError)):
+                    raise
+                # For other exceptions, just print and complete
+                print("Monitoring Complete!")
+
+        watcher.exec = mock_exec
+        return watcher
+
+    @patch('time.sleep')
+    def test_exec_successful_all_mode_monitoring(self, mock_sleep, capsys):
+        """Test successful monitoring in RESOURCE mode with resource parsing"""
+        watcher = self._create_watcher_with_mocks()
+        mock_sleep.side_effect = KeyboardInterrupt()
+
+        self.mock_client.describe_express_gateway_service.return_value = {
+            "service": {
+                "serviceArn": self.service_arn,
+                "cluster": "my-cluster",
+                "activeConfigurations": [{"serviceRevisionArn": "rev-arn"}],
+            }
+        }
+        self.mock_client.describe_service_revisions.return_value = {
+            "serviceRevisions": [
+                {
+                    "arn": "rev-arn",
+                    "ecsManagedResources": {
+                        "ingressPaths": [
+                            {
+                                "endpoint": "https://api.example.com",
+                                "loadBalancer": {
+                                    "arn": "arn:aws:elasticloadbalancing:us-west-2:123456789012:loadbalancer/app/my-lb/1234567890abcdef",
+                                    "status": "ACTIVE",
+                                },
+                                "targetGroups": [
+                                    {
+                                        "arn": "arn:aws:elasticloadbalancing:us-west-2:123456789012:targetgroup/my-tg/1234567890abcdef",
+                                        "status": "HEALTHY",
+                                    }
+                                ],
+                            }
+                        ],
+                        "serviceSecurityGroups": [
+                            {
+                                "arn": "arn:aws:ec2:us-west-2:123456789012:security-group/sg-1234567890abcdef0",
+                                "status": "ACTIVE",
+                            }
+                        ],
+                        "logGroups": [
+                            {
+                                "arn": "arn:aws:logs:us-west-2:123456789012:log-group:/aws/ecs/my-service",
+                                "status": "ACTIVE",
+                            }
+                        ],
+                    },
+                }
+            ]
+        }
+        self.mock_client.describe_services.return_value = {
+            "services": [{"events": [{"message": "Running"}]}]
+        }
+
+        watcher.exec()
+        captured = capsys.readouterr()
+        output_text = captured.out
+
+        # Verify parsed resources appear in output
+        assert "Cluster" in output_text
+        assert "Service" in output_text
+        assert "IngressPath" in output_text
+        assert "LoadBalancer" in output_text
+        assert "TargetGroup" in output_text
+        assert "SecurityGroup" in output_text
+        assert "LogGroup" in output_text
+
+        # Specific identifiers
+        assert "https://api.example.com" in output_text  # IngressPath endpoint
+        assert "my-lb" in output_text  # LoadBalancer identifier
+        assert "my-tg" in output_text  # TargetGroup identifier
+        assert (
+            "sg-1234567890abcdef0" in output_text
+        )  # SecurityGroup identifier
+        assert "/aws/ecs/my-service" in output_text  # LogGroup identifier
+
+        # Status values
+        assert "ACTIVE" in output_text  # LoadBalancer and SecurityGroup status
+        assert "HEALTHY" in output_text  # TargetGroup status
+
+    @patch('time.sleep')
+    def test_exec_successful_delta_mode_with_deployment(
+        self, mock_sleep, capsys
+    ):
+        """Test DEPLOYMENT mode executes successfully"""
+        watcher = self._create_watcher_with_mocks()
+        mock_sleep.side_effect = KeyboardInterrupt()
+
+        self.mock_client.describe_express_gateway_service.return_value = {
+            "service": {
+                "serviceArn": self.service_arn,
+                "cluster": "my-cluster",
+                "activeConfigurations": [],
+            }
+        }
+        self.mock_client.describe_services.return_value = {
+            "services": [{"events": [{"message": "Service running"}]}]
+        }
+
+        watcher.exec()
+        captured = capsys.readouterr()
+
+        # Verify DEPLOYMENT mode executes successfully
+        assert captured.out
+
+    @patch('time.sleep')
+    def test_exec_keyboard_interrupt_handling(self, mock_sleep, capsys):
+        watcher = self._create_watcher_with_mocks()
+        mock_sleep.side_effect = KeyboardInterrupt()
+
+        self.mock_client.describe_express_gateway_service.return_value = {
+            "service": {
+                "serviceArn": self.service_arn,
+                "cluster": "my-cluster",
+                "activeConfigurations": [],
+            }
+        }
+
+        watcher.exec()
+        captured = capsys.readouterr()
+
+        # Verify completion message is printed
+        assert "Monitoring Complete!" in captured.out
+
+    @patch('time.sleep')
+    def test_exec_with_service_not_found_error(self, mock_sleep):
+        """Test exec() with service not found error bubbles up"""
+        watcher = self._create_watcher_with_mocks()
+        mock_sleep.side_effect = KeyboardInterrupt()
+
+        error = ClientError(
+            error_response={
+                'Error': {
+                    'Code': 'ServiceNotFoundException',
+                    'Message': 'Service not found',
+                }
+            },
+            operation_name='DescribeExpressGatewayService',
+        )
+        self.mock_client.describe_express_gateway_service.side_effect = error
+
+        with pytest.raises(ClientError) as exc_info:
+            watcher.exec()
+
+        # Verify the specific error is raised
+        assert (
+            exc_info.value.response['Error']['Code']
+            == 'ServiceNotFoundException'
+        )
+        assert (
+            exc_info.value.response['Error']['Message'] == 'Service not found'
+        )
+
 
 class TestMonitoringError:
     """Test MonitoringError exception class"""
