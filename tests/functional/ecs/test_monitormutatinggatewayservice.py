@@ -98,6 +98,7 @@ class TestMonitorMutatingGatewayService:
         parsed_args = Mock()
         # Remove the attribute
         del parsed_args.monitor_resources
+        parsed_args.monitor_mode = None
         parsed_globals = Mock()
 
         self.handler.operation_args_parsed(parsed_args, parsed_globals)
