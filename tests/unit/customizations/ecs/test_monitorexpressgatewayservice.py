@@ -151,12 +151,12 @@ class TestECSExpressGatewayServiceWatcher:
             display=mock_display,
         )
 
-        # Mock exec to call the monitoring method once and print output
-        original_monitor = watcher._monitor_express_gateway_service
+        # Mock exec to call the collector once and print output
+        collector = watcher.collector
 
         def mock_exec():
             try:
-                output = original_monitor("⠋", self.service_arn, resource_view)
+                output = collector.get_current_view("⠋")
                 print(output)
                 print("Monitoring Complete!")
             except Exception as e:
